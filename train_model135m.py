@@ -2,7 +2,8 @@ import os
 import math
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
+from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 from model135m import SmolLM2ForCausalLM135M, SmolLM2Config135M
@@ -126,10 +127,10 @@ class SmolLM2LightningModule(pl.LightningModule):
         logging.info(f"- Total steps: {total_steps}")
         
         # Initialize tokenizer first
-        logging.info("Initializing tokenizer...")
+        # logging.info("Initializing tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/cosmo2-tokenizer")
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        logging.info("Tokenizer initialization complete")
+        # logging.info("Tokenizer initialization complete")
         
         # Initialize model and config
         self.config = config if config else SmolLM2Config135M()
@@ -226,7 +227,7 @@ class SmolLM2LightningModule(pl.LightningModule):
         step_start = time.time()
         x, y = batch
         
-        # Forward pass without explicit autocast (handled by Lightning)
+        # Forward pass
         outputs = self.model(input_ids=x, labels=y)
         loss = outputs.loss
         
@@ -235,7 +236,15 @@ class SmolLM2LightningModule(pl.LightningModule):
         step_time = step_end - step_start
         self.step_times.append(step_time)
         
-        # Log every 50 steps using actual global step
+        # Log metrics for progress bar
+        self.log_dict({
+            'train_loss': loss,
+            'learning_rate': self.learning_rate,
+            'step': self.global_step,
+            'step_time': step_time
+        }, prog_bar=True, sync_dist=True)
+        
+        # Existing logging code
         if self.global_step % 50 == 0:
             current_time = time.time()
             elapsed = current_time - self.training_start_time
@@ -254,8 +263,6 @@ class SmolLM2LightningModule(pl.LightningModule):
                         f"Average step time: {time_per_step:.3f}s, "
                         f"Estimated time remaining: {timedelta(seconds=int(eta))}")
         
-        # Log metrics
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         return loss
 
     def on_train_start(self):
@@ -331,6 +338,24 @@ def train_model(
     # logging.info("Initializing model")
     model = SmolLM2LightningModule(config=config, total_steps=total_steps)
     
+    # Create progress bar callback with simplified configuration
+    progress_bar = RichProgressBar(
+        refresh_rate=1, 
+        leave=False, 
+        theme=RichProgressBarTheme(
+            description='', 
+            progress_bar='#6206E0', 
+            progress_bar_finished='#6206E0', 
+            progress_bar_pulse='#6206E0', 
+            batch_progress='', 
+            time='dim', 
+            processing_speed='dim underline', 
+            metrics='italic', 
+            metrics_text_delimiter=' ', 
+            metrics_format='.3f'), 
+        console_kwargs=None
+    )
+    
     # Update checkpoint callback to save global step
     checkpoint_callback = ModelCheckpoint(
         dirpath='lightning_checkpoints',
@@ -338,13 +363,13 @@ def train_model(
         every_n_train_steps=20,
         save_top_k=-1,
         save_last=True,
-        save_on_train_epoch_end=False  # Ensure we save based on steps
+        save_on_train_epoch_end=False
     )
     
-    # Update trainer setup with correct max_steps
+    # Update trainer setup with RichProgressBar
     trainer = pl.Trainer(
         max_steps=total_steps,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, progress_bar],
         accelerator='auto',
         devices=1,
         precision="16-mixed",
@@ -357,9 +382,8 @@ def train_model(
         enable_checkpointing=True,
         reload_dataloaders_every_n_epochs=1,
         num_sanity_val_steps=0,
-        # Add these settings for better step tracking
-        max_epochs=None,  # Disable epoch-based training
-        check_val_every_n_epoch=None  # Disable validation
+        max_epochs=None,
+        check_val_every_n_epoch=None
     )
     
     # Training
