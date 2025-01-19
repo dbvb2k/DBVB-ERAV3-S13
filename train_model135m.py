@@ -22,7 +22,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-NUM_DASHES = 50
+NUM_DASHES = 100
 
 def setup_training_environment():
     """Setup training environment including CUDA and precision settings"""
@@ -49,7 +49,6 @@ class TextDataset(Dataset):
         self.vocab_size = vocab_size
         
         # Load and tokenize text
-        logging.info("-" * NUM_DASHES)
         logging.info("Loading text from input.txt...")
         with open('input.txt', 'r') as f:
             text = f.read()
@@ -120,7 +119,8 @@ class SmolLM2LightningModule(pl.LightningModule):
         
         # Remove autocast initialization as it's handled by Lightning
         self.save_hyperparameters()
-        
+
+        logging.info("-" * NUM_DASHES)
         logging.info("Initializing SmolLM2LightningModule")
         logging.info(f"- Learning rate: {learning_rate}")
         logging.info(f"- Total steps: {total_steps}")
@@ -286,7 +286,9 @@ def train_model(
     additional_steps: Optional[int] = None
 ):
     start_time = time.time()
-    logging.info("Starting training process")
+    logging.info("=" * NUM_DASHES)
+    logging.info("Starting training process ...")
+    logging.info("=" * NUM_DASHES)
     
     # Setup training environment (will run only once)
     setup_training_environment()
@@ -296,9 +298,10 @@ def train_model(
     logging.info("Random seeds set")
     
     # Initialize config and dataset
-    logging.info("Initializing model configuration")
+    # logging.info("Initializing model configuration")
     config = SmolLM2Config135M()
-    
+
+    logging.info("-" * NUM_DASHES)    
     logging.info("Setting up dataset and data loader")
     dataset = TextDataset(block_size=128, vocab_size=config.vocab_size)
     
@@ -317,7 +320,7 @@ def train_model(
     )
     
     # Calculate steps
-    total_steps = 5000
+    total_steps = 500
     if resume_from_checkpoint and additional_steps:
         logging.info(f"Loading checkpoint: {resume_from_checkpoint}")
         checkpoint = torch.load(resume_from_checkpoint)
@@ -341,6 +344,7 @@ def train_model(
     )
     
     # Trainer setup with updated precision settings
+    logging.info("-" * NUM_DASHES)
     logging.info("Initializing trainer")
     trainer = pl.Trainer(
         max_steps=total_steps,
@@ -359,6 +363,7 @@ def train_model(
     
     # Training
     try:
+        logging.info("-" * NUM_DASHES)
         logging.info("Starting training")
         if resume_from_checkpoint:
             trainer.fit(model, train_loader, ckpt_path=resume_from_checkpoint)
@@ -367,6 +372,8 @@ def train_model(
             
         end_time = time.time()
         total_time = end_time - start_time
+
+        logging.info("-" * NUM_DASHES)
         logging.info("\nTraining completed successfully!")
         logging.info(f"Total training time: {timedelta(seconds=int(total_time))}")
         logging.info(f"Checkpoints saved in: {checkpoint_callback.dirpath}")
