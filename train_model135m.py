@@ -2,8 +2,7 @@ import os
 import math
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
-from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 from model135m import SmolLM2ForCausalLM135M, SmolLM2Config135M
@@ -16,6 +15,7 @@ import time
 from datetime import timedelta
 import torch.backends.cuda as cuda
 import torch.cuda
+from torch.nn.functional import scaled_dot_product_attention
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,18 +63,15 @@ class TextDataset(Dataset):
         tokens = self.tokenizer.encode(text)
         logging.info(f"Initial tokenization complete: {len(tokens)} tokens")
         
-        # Token processing
+        # Token processing - ensure all tokens are valid
         logging.info("Processing tokens...")
         tokens = [t if t < vocab_size else self.tokenizer.unk_token_id for t in tokens]
+        # Ensure no zero tokens
+        tokens = [t if t > 0 else self.tokenizer.unk_token_id for t in tokens]
         self.tokens = torch.tensor(tokens, dtype=torch.long)
         
         # Calculate statistics
-        self.n_samples = max(0, (len(self.tokens) - self.block_size - 1))
-        logging.info("-" * NUM_DASHES)
-        logging.info(f"Dataset statistics:")
-        logging.info(f"- Total tokens: {len(self.tokens)}")
-        logging.info(f"- Block size: {self.block_size}")
-        logging.info(f"- Number of samples: {self.n_samples}")
+        self.n_samples = max(0, len(self.tokens) - self.block_size - 1)
         
         # Validate token range
         max_token = self.tokens.max().item()
@@ -82,7 +79,7 @@ class TextDataset(Dataset):
         logging.info(f"Token range validation:")
         logging.info(f"- Minimum token ID: {min_token}")
         logging.info(f"- Maximum token ID: {max_token}")
-        logging.info(f"- Vocabulary size: {vocab_size}")
+        assert min_token > 0, f"Found token {min_token} <= 0"
         assert max_token < vocab_size, f"Found token {max_token} >= vocab_size {vocab_size}"
         
         logging.info("Dataset initialization complete")
@@ -94,10 +91,9 @@ class TextDataset(Dataset):
         if idx >= self.n_samples:
             raise IndexError(f"Index {idx} out of bounds for dataset with {self.n_samples} samples")
         
-        # Get sequence
+        # Get sequence and ensure no zero tokens
         chunk = self.tokens[idx:idx + self.block_size + 1].clone()
-        
-        # Validate sequence
+        assert chunk.min() > 0, "Found zero or negative token ID"
         assert chunk.max() < self.vocab_size, f"Token value {chunk.max()} exceeds vocab size {self.vocab_size}"
         assert len(chunk) == self.block_size + 1, f"Sequence length {len(chunk)} != {self.block_size + 1}"
         
@@ -152,6 +148,7 @@ class SmolLM2LightningModule(pl.LightningModule):
         logging.info(f"Model parameters:")
         logging.info(f"- Total: {total_params:,}")
         logging.info(f"- Trainable: {trainable_params:,}")
+        logging.info("-" * NUM_DASHES)
         
         self.training_start_time = None
         self.last_log_time = None
@@ -195,7 +192,7 @@ class SmolLM2LightningModule(pl.LightningModule):
             "attention_mask": attention_mask,
             "use_cache": True,
             "no_repeat_ngram_size": 3,
-            "early_stopping": True
+            "early_stopping": False
         }
         
         try:
@@ -236,32 +233,36 @@ class SmolLM2LightningModule(pl.LightningModule):
         step_time = step_end - step_start
         self.step_times.append(step_time)
         
+        # Calculate time metrics for every step
+        current_time = time.time()
+        elapsed = current_time - self.training_start_time
+        time_per_step = sum(self.step_times[-100:]) / min(len(self.step_times), 100)
+        steps_remaining = self.total_steps - self.global_step
+        eta = steps_remaining * time_per_step
+        
         # Log metrics for progress bar
         self.log_dict({
             'train_loss': loss,
             'learning_rate': self.learning_rate,
-            'step': self.global_step,
-            'step_time': step_time
-        }, prog_bar=True, sync_dist=True)
+            'global_step': self.global_step,
+            'step_time': step_time,
+            'eta': eta,
+            'elapsed': elapsed
+        }, prog_bar=True, sync_dist=True, on_step=True)
         
-        # Existing logging code
-        if self.global_step % 50 == 0:
-            current_time = time.time()
-            elapsed = current_time - self.training_start_time
-            time_per_step = sum(self.step_times[-100:]) / min(len(self.step_times), 100)
-            steps_remaining = self.total_steps - self.global_step
-            eta = steps_remaining * time_per_step
+        # # Log detailed information every 50 steps
+        # if self.global_step % 50 == 0:
+        #     logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, "
+        #                 f"Input range: [{x.min().item()}, {x.max().item()}]")
+
+            # if torch.cuda.is_available():
+            #     logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
+            #                 f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
             
-            logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, "
-                        f"Input range: [{x.min().item()}, {x.max().item()}]")
-            if torch.cuda.is_available():
-                logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
-                            f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
-            
-            logging.info(f"\nTraining Status - Step {self.global_step}/{self.total_steps}")
-            logging.info(f"- Loss: {loss.item():.4f}, Time elapsed: {timedelta(seconds=int(elapsed))}, "
-                        f"Average step time: {time_per_step:.3f}s, "
-                        f"Estimated time remaining: {timedelta(seconds=int(eta))}")
+            # logging.info(f"\nTraining Status - Step {self.global_step}/{self.total_steps}")
+            # logging.info(f"- Loss: {loss.item():.4f}, Time elapsed: {timedelta(seconds=int(elapsed))}, "
+            #             f"Average step time: {time_per_step:.3f}s, "
+            #             f"Estimated time remaining: {timedelta(seconds=int(eta))}")
         
         return loss
 
@@ -313,9 +314,10 @@ def train_model(
         batch_size=8,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
+        drop_last=True
     )
     
     # Update step calculation logic
@@ -338,35 +340,25 @@ def train_model(
     # logging.info("Initializing model")
     model = SmolLM2LightningModule(config=config, total_steps=total_steps)
     
-    # Create progress bar callback with simplified configuration
-    progress_bar = RichProgressBar(
-        refresh_rate=1, 
-        leave=False, 
-        theme=RichProgressBarTheme(
-            description='', 
-            progress_bar='#6206E0', 
-            progress_bar_finished='#6206E0', 
-            progress_bar_pulse='#6206E0', 
-            batch_progress='', 
-            time='dim', 
-            processing_speed='dim underline', 
-            metrics='italic', 
-            metrics_text_delimiter=' ', 
-            metrics_format='.3f'), 
-        console_kwargs=None
-    )
-    
-    # Update checkpoint callback to save global step
+    # Create callbacks
     checkpoint_callback = ModelCheckpoint(
         dirpath='lightning_checkpoints',
         filename='smollm2-{step}-{train_loss:.2f}',
         every_n_train_steps=20,
-        save_top_k=-1,
+        save_top_k=5,
+        monitor='train_loss',
+        mode='min',
         save_last=True,
         save_on_train_epoch_end=False
     )
     
-    # Update trainer setup with RichProgressBar
+    # Use TQDM progress bar instead
+    progress_bar = TQDMProgressBar(
+        refresh_rate=1,
+        process_position=0
+    )
+    
+    # Update trainer setup
     trainer = pl.Trainer(
         max_steps=total_steps,
         callbacks=[checkpoint_callback, progress_bar],
@@ -380,10 +372,12 @@ def train_model(
         accumulate_grad_batches=16,
         strategy='auto',
         enable_checkpointing=True,
-        reload_dataloaders_every_n_epochs=1,
         num_sanity_val_steps=0,
         max_epochs=None,
-        check_val_every_n_epoch=None
+        check_val_every_n_epoch=None,
+        enable_model_summary=False,
+        reload_dataloaders_every_n_epochs=0,
+        deterministic=True
     )
     
     # Training
@@ -403,7 +397,6 @@ def train_model(
         end_time = time.time()
         total_time = end_time - start_time
 
-        logging.info("-" * NUM_DASHES)
         logging.info("\nTraining completed successfully!")
         logging.info(f"Total training time: {timedelta(seconds=int(total_time))}")
         logging.info(f"Final step: {model.global_step}")

@@ -167,14 +167,24 @@ class SmolLM2Attention135M(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # Compute attention
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Compute attention - manual
+        # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        # if attention_mask is not None:
+        #     attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # attn_output = torch.matmul(attn_weights, value_states)
+
+        # Replace manual attention computation with torch.nn.functional.scaled_dot_product_attention
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=attention_mask is None
+        )        
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
