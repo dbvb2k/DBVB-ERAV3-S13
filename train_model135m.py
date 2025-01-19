@@ -140,6 +140,7 @@ class SmolLM2LightningModule(pl.LightningModule):
                 if not key.startswith('_'):
                     logging.info(f"- {key}: {value}")
         
+        logging.info("-" * NUM_DASHES)
         logging.info("Initializing model...")
         self.model = SmolLM2ForCausalLM135M(self.config)
         logging.info("Model initialization complete")
@@ -158,6 +159,9 @@ class SmolLM2LightningModule(pl.LightningModule):
         # Add prompt for inference
         self.test_prompt = "Once upon a time"
         self.inference_steps = 500
+        
+        # Add step tracking
+        self.automatic_optimization = True
         
     def generate_sample_text(self):
         """Generate sample text using the current model state"""
@@ -222,47 +226,35 @@ class SmolLM2LightningModule(pl.LightningModule):
         step_start = time.time()
         x, y = batch
         
-        # Log batch statistics
-        if batch_idx % 50 == 0:
-            logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, Input range: [{x.min().item()}, {x.max().item()}]")
-        
         # Forward pass without explicit autocast (handled by Lightning)
         outputs = self.model(input_ids=x, labels=y)
         loss = outputs.loss
-        
-        # Synchronize CUDA for accurate timing
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         
         # Calculate training statistics
         step_end = time.time()
         step_time = step_end - step_start
         self.step_times.append(step_time)
         
-        # Log memory usage if CUDA is available
-        if batch_idx % 50 == 0 and torch.cuda.is_available():
-            logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
-                        f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
-        
-        # Log every 50 steps
-        if batch_idx % 50 == 0:
+        # Log every 50 steps using actual global step
+        if self.global_step % 50 == 0:
             current_time = time.time()
             elapsed = current_time - self.training_start_time
             time_per_step = sum(self.step_times[-100:]) / min(len(self.step_times), 100)
             steps_remaining = self.total_steps - self.global_step
             eta = steps_remaining * time_per_step
             
-            logging.info(f"\nTraining Status - Step {self.global_step}/{self.total_steps}")
-            logging.info(f"- Loss: {loss.item():.4f}, Time elapsed: {timedelta(seconds=int(elapsed))}, Average step time: {time_per_step:.3f}s, Estimated time remaining: {timedelta(seconds=int(eta))}")
+            logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, "
+                        f"Input range: [{x.min().item()}, {x.max().item()}]")
+            if torch.cuda.is_available():
+                logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
+                            f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
             
-            # Reset for next window
-            self.last_log_time = current_time
+            logging.info(f"\nTraining Status - Step {self.global_step}/{self.total_steps}")
+            logging.info(f"- Loss: {loss.item():.4f}, Time elapsed: {timedelta(seconds=int(elapsed))}, "
+                        f"Average step time: {time_per_step:.3f}s, "
+                        f"Estimated time remaining: {timedelta(seconds=int(eta))}")
         
-        # Generate sample text every inference_steps
-        if self.global_step > 0 and self.global_step % self.inference_steps == 0:
-            logging.info(f"\nPerforming inference at step {self.global_step}")
-            self.generate_sample_text()
-        
+        # Log metrics
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -314,51 +306,60 @@ def train_model(
         batch_size=8,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
         prefetch_factor=2,
     )
     
-    # Calculate steps
-    total_steps = 500
+    # Update step calculation logic
     if resume_from_checkpoint and additional_steps:
         logging.info(f"Loading checkpoint: {resume_from_checkpoint}")
+        # Load checkpoint to get current step
         checkpoint = torch.load(resume_from_checkpoint)
-        current_step = checkpoint.get('current_step', 0)
+        # Get the global step from checkpoint
+        current_step = checkpoint.get('global_step', 0)
+        logging.info(f"Resuming from global step {current_step}")
+        # Calculate total steps as current + additional
         total_steps = current_step + additional_steps
-        logging.info(f"Resuming from step {current_step}")
-        logging.info(f"Will train until step {total_steps}")
+        logging.info(f"Will train for {additional_steps} more steps until step {total_steps}")
+    else:
+        total_steps = 500  # Default steps for new training
+        current_step = 0
+        logging.info(f"Starting new training for {total_steps} steps")
     
     # Model setup
     # logging.info("Initializing model")
     model = SmolLM2LightningModule(config=config, total_steps=total_steps)
     
-    # Checkpoint setup
-    logging.info("Configuring checkpoints")
+    # Update checkpoint callback to save global step
     checkpoint_callback = ModelCheckpoint(
         dirpath='lightning_checkpoints',
         filename='smollm2-{step}-{train_loss:.2f}',
         every_n_train_steps=20,
         save_top_k=-1,
-        save_last=True
+        save_last=True,
+        save_on_train_epoch_end=False  # Ensure we save based on steps
     )
     
-    # Trainer setup with updated precision settings
-    logging.info("-" * NUM_DASHES)
-    logging.info("Initializing trainer")
+    # Update trainer setup with correct max_steps
     trainer = pl.Trainer(
         max_steps=total_steps,
         callbacks=[checkpoint_callback],
         accelerator='auto',
         devices=1,
-        # Update precision setting to use mixed precision
-        precision="16-mixed",  # Use 16-bit mixed precision
+        precision="16-mixed",
         enable_progress_bar=True,
         logger=True,
         log_every_n_steps=1,
         gradient_clip_val=1.0,
         accumulate_grad_batches=16,
-        strategy='auto'
+        strategy='auto',
+        enable_checkpointing=True,
+        reload_dataloaders_every_n_epochs=1,
+        num_sanity_val_steps=0,
+        # Add these settings for better step tracking
+        max_epochs=None,  # Disable epoch-based training
+        check_val_every_n_epoch=None  # Disable validation
     )
     
     # Training
@@ -366,7 +367,12 @@ def train_model(
         logging.info("-" * NUM_DASHES)
         logging.info("Starting training")
         if resume_from_checkpoint:
-            trainer.fit(model, train_loader, ckpt_path=resume_from_checkpoint)
+            # Pass global_step to ensure correct step counting
+            trainer.fit(
+                model, 
+                train_loader, 
+                ckpt_path=resume_from_checkpoint
+            )
         else:
             trainer.fit(model, train_loader)
             
@@ -376,6 +382,7 @@ def train_model(
         logging.info("-" * NUM_DASHES)
         logging.info("\nTraining completed successfully!")
         logging.info(f"Total training time: {timedelta(seconds=int(total_time))}")
+        logging.info(f"Final step: {model.global_step}")
         logging.info(f"Checkpoints saved in: {checkpoint_callback.dirpath}")
         
     except Exception as e:
