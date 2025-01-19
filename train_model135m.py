@@ -13,6 +13,8 @@ import logging
 from tqdm.auto import tqdm
 import time
 from datetime import timedelta
+import torch.backends.cuda as cuda
+import torch.cuda
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +23,24 @@ logging.basicConfig(
 )
 
 NUM_DASHES = 50
+
+def setup_training_environment():
+    """Setup training environment including CUDA and precision settings"""
+    # Set high precision matrix multiplication (only once)
+    torch.set_float32_matmul_precision('high')
+    logging.info("Set float32 matmul precision to high")
+    
+    # Set up CUDA settings
+    if torch.cuda.is_available():
+        logging.info("CUDA is available")
+        logging.info(f"Using device: {torch.cuda.get_device_name()}")
+        logging.info(f"CUDA version: {torch.version.cuda}")
+        
+        # Enable CUDA synchronization for accurate timing
+        torch.cuda.synchronize()
+        logging.info("CUDA synchronization enabled")
+    else:
+        logging.warning("CUDA is not available, training on CPU")
 
 class TextDataset(Dataset):
     def __init__(self, block_size: int = 128, vocab_size: int = 49152):
@@ -98,6 +118,7 @@ class SmolLM2LightningModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.total_steps = total_steps
         
+        # Remove autocast initialization as it's handled by Lightning
         self.save_hyperparameters()
         
         logging.info("Initializing SmolLM2LightningModule")
@@ -205,14 +226,23 @@ class SmolLM2LightningModule(pl.LightningModule):
         if batch_idx % 50 == 0:
             logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, Input range: [{x.min().item()}, {x.max().item()}]")
         
-        # Forward pass
+        # Forward pass without explicit autocast (handled by Lightning)
         outputs = self.model(input_ids=x, labels=y)
         loss = outputs.loss
+        
+        # Synchronize CUDA for accurate timing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         
         # Calculate training statistics
         step_end = time.time()
         step_time = step_end - step_start
         self.step_times.append(step_time)
+        
+        # Log memory usage if CUDA is available
+        if batch_idx % 50 == 0 and torch.cuda.is_available():
+            logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
+                        f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
         
         # Log every 50 steps
         if batch_idx % 50 == 0:
@@ -257,6 +287,9 @@ def train_model(
 ):
     start_time = time.time()
     logging.info("Starting training process")
+    
+    # Setup training environment (will run only once)
+    setup_training_environment()
     
     # Set up seeds
     pl.seed_everything(1566)
@@ -307,14 +340,15 @@ def train_model(
         save_last=True
     )
     
-    # Trainer setup
+    # Trainer setup with updated precision settings
     logging.info("Initializing trainer")
     trainer = pl.Trainer(
         max_steps=total_steps,
         callbacks=[checkpoint_callback],
         accelerator='auto',
         devices=1,
-        precision='32-true',
+        # Update precision setting to use mixed precision
+        precision="16-mixed",  # Use 16-bit mixed precision
         enable_progress_bar=True,
         logger=True,
         log_every_n_steps=1,

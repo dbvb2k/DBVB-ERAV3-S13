@@ -4,6 +4,7 @@ from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from typing import Optional, Tuple, Union, List
 import math
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
+import logging
 
 
 class SmolLM2Config135M(PretrainedConfig):
@@ -389,7 +390,17 @@ class SmolLM2ForCausalLM135M(PreTrainedModel, GenerationMixin):
     def __init__(self, config: SmolLM2Config135M):
         super().__init__(config)
         self.model = SmolLM2Model135M(config)
+        
+        # Initialize lm_head
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # Implement weight tying if configured
+        if config.tie_word_embeddings:
+            # Share weights between input embeddings and output layer
+            self.lm_head.weight = self.model.embed_tokens.weight
+            logging.info("Weight tying enabled: Input embeddings and output layer weights are shared")
+        else:
+            logging.info("Weight tying disabled: Using separate weights for input embeddings and output layer")
         
         # Set generation parameters
         self.main_input_name = "input_ids"
@@ -404,12 +415,18 @@ class SmolLM2ForCausalLM135M(PreTrainedModel, GenerationMixin):
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
+        # Update lm_head weights if using weight tying
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def get_output_embeddings(self):
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+        # Update input embeddings if using weight tying
+        if self.config.tie_word_embeddings:
+            self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(
         self,
