@@ -76,7 +76,16 @@ The training process uses PyTorch Lightning with the following key configuration
   - Keep Top: 5 checkpoints
   - Monitor: train_loss
 
+# Initial training (v2 is non pytorch-lightning version)
+python train_model135m.py --total_steps 5000
+python train_model135m_v2.py --total_steps 5000
+ 
+# Resume training with additional steps (v2 is non pytorch-lightning version)
+python train_model135m.py --additional_steps 500
+python train_model135m_v2.py --additional_steps 500
+
 ## Training Logs
+
 Sample training progress:
 Log 1
 ![Training Log 1](./images/training-scr1.png?raw=true "Training Log 1")
