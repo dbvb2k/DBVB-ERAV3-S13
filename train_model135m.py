@@ -16,6 +16,13 @@ from datetime import timedelta
 import torch.backends.cuda as cuda
 import torch.cuda
 from torch.nn.functional import scaled_dot_product_attention
+from datasets import load_dataset
+from itertools import islice
+import signal
+import sys
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+import yaml
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,222 +56,218 @@ class TextDataset(Dataset):
         self.block_size = block_size
         self.vocab_size = vocab_size
         
-        # Load and tokenize text
-        logging.info("Loading text from input.txt...")
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        logging.info(f"Loaded text with {len(text)} characters")
-        
         # Initialize tokenizer
         logging.info("-" * NUM_DASHES)
         logging.info("Initializing tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/cosmo2-tokenizer")
-        logging.info("Tokenizing text...")
-        tokens = self.tokenizer.encode(text)
-        logging.info(f"Initial tokenization complete: {len(tokens)} tokens")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        logging.info("Tokenizer initialized")
         
-        # Token processing - ensure all tokens are valid
-        logging.info("Processing tokens...")
-        tokens = [t if t < vocab_size else self.tokenizer.unk_token_id for t in tokens]
-        # Ensure no zero tokens
-        tokens = [t if t > 0 else self.tokenizer.unk_token_id for t in tokens]
-        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        # Load dataset with streaming
+        logging.info("Loading dataset using HuggingFace datasets (streaming mode) ...")
+        self.dataset = load_dataset(
+            "HuggingFaceTB/smollm-corpus",
+            "cosmopedia-v2",
+            split="train",  # Explicitly specify split
+            streaming=True
+        )
+        logging.info("Dataset loaded successfully")
         
-        # Calculate statistics
-        self.n_samples = max(0, len(self.tokens) - self.block_size - 1)
+        # Convert streaming dataset to list for length calculation and random access
+        logging.info("Processing dataset...")
+        self.processed_data = []
+        total_sequences = 0
+        total_examples = 0
         
-        # Validate token range
-        max_token = self.tokens.max().item()
-        min_token = self.tokens.min().item()
-        logging.info(f"Token range validation:")
-        logging.info(f"- Minimum token ID: {min_token}")
-        logging.info(f"- Maximum token ID: {max_token}")
-        assert min_token > 0, f"Found token {min_token} <= 0"
-        assert max_token < vocab_size, f"Found token {max_token} >= vocab_size {vocab_size}"
+        initial_examples = 1000
+        # Create progress bar for initial examples
+        pbar = tqdm(islice(self.dataset, initial_examples), desc="Processing examples", unit=" examples")
         
-        logging.info("Dataset initialization complete")
+        try:
+            for item in pbar:
+                total_examples += 1
+                # Tokenize with padding and truncation
+                encoding = self.tokenizer(
+                    item["text"],
+                    max_length=self.block_size * 2,  # Allow longer sequences initially
+                    truncation=True,
+                    padding=False,
+                    return_tensors=None  # Return list of ints
+                )
+                
+                tokens = encoding
+                if isinstance(tokens, dict):
+                    tokens = tokens["input_ids"]
+                
+                # Process tokens in strided sequences
+                stride = self.block_size // 2  # 50% overlap between sequences
+                for i in range(0, len(tokens) - self.block_size, stride):
+                    chunk = tokens[i:i + self.block_size + 1]
+                    if len(chunk) == self.block_size + 1:
+                        # Convert to tensor and validate
+                        chunk_tensor = torch.tensor(chunk, dtype=torch.long)
+                        if (chunk_tensor >= 0).all() and (chunk_tensor < self.vocab_size).all():
+                            self.processed_data.append(chunk_tensor)
+                            total_sequences += 1
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'total_sequences': total_sequences,
+                    'avg_seq_per_example': total_sequences/total_examples if total_examples > 0 else 0
+                })
+                
+                # Break if we have enough sequences
+                if total_sequences >= 1000:
+                    break
+                    
+        except Exception as e:
+            logging.error(f"Error processing dataset: {str(e)}")
+            raise
+            
+        if not self.processed_data:
+            raise ValueError("No sequences were processed. Check dataset and processing logic.")
+            
+        self.n_samples = len(self.processed_data)
+        logging.info(f"Dataset processing complete. Total sequences: {self.n_samples}")
+        logging.info(f"Average sequence length: {sum(len(seq) for seq in self.processed_data)/self.n_samples:.1f}")
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
-        if idx >= self.n_samples:
-            raise IndexError(f"Index {idx} out of bounds for dataset with {self.n_samples} samples")
-        
-        # Get sequence and ensure no zero tokens
-        chunk = self.tokens[idx:idx + self.block_size + 1].clone()
-        assert chunk.min() > 0, "Found zero or negative token ID"
-        assert chunk.max() < self.vocab_size, f"Token value {chunk.max()} exceeds vocab size {self.vocab_size}"
-        assert len(chunk) == self.block_size + 1, f"Sequence length {len(chunk)} != {self.block_size + 1}"
-        
-        x = chunk[:-1]
-        y = chunk[1:]
+        sequence = self.processed_data[idx]
+        x = sequence[:-1]  # Input sequence
+        y = sequence[1:]   # Target sequence
         return x, y
 
 class SmolLM2LightningModule(pl.LightningModule):
     def __init__(
         self, 
         config: Optional[SmolLM2Config135M] = None,
-        learning_rate: float = 3e-4,
-        total_steps: int = 5000
+        learning_rate: float = 0.003,  # From config
+        total_steps: int = 2000000,    # From config
+        warmup_steps: int = 2000,      # From config
+        inference_interval: int = 500,
     ):
         super().__init__()
-        
-        # Store parameters as instance variables
+        self.save_hyperparameters()
+        self.config = config
         self.learning_rate = learning_rate
         self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.inference_interval = inference_interval
+        self.last_inference_step = -1
         
-        # Remove autocast initialization as it's handled by Lightning
-        self.save_hyperparameters()
-
-        logging.info("-" * NUM_DASHES)
-        logging.info("Initializing SmolLM2LightningModule")
-        logging.info(f"- Learning rate: {learning_rate}")
-        logging.info(f"- Total steps: {total_steps}")
-        
-        # Initialize tokenizer first
-        # logging.info("Initializing tokenizer...")
+        # Initialize model
+        self.model = SmolLM2ForCausalLM135M(config)
         self.tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/cosmo2-tokenizer")
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        # logging.info("Tokenizer initialization complete")
-        
-        # Initialize model and config
-        self.config = config if config else SmolLM2Config135M()
-        showModelConfig = False
-        if showModelConfig:
-            logging.info("Model configuration:")
-            for key, value in self.config.__dict__.items():
-                if not key.startswith('_'):
-                    logging.info(f"- {key}: {value}")
-        
-        logging.info("-" * NUM_DASHES)
-        logging.info("Initializing model...")
-        self.model = SmolLM2ForCausalLM135M(self.config)
-        logging.info("Model initialization complete")
-        
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logging.info(f"Model parameters:")
-        logging.info(f"- Total: {total_params:,}")
-        logging.info(f"- Trainable: {trainable_params:,}")
-        logging.info("-" * NUM_DASHES)
-        
-        self.training_start_time = None
-        self.last_log_time = None
-        self.step_times = []
-        
-        # Add prompt for inference
         self.test_prompt = "Once upon a time"
-        self.inference_steps = 500
-        
-        # Add step tracking
-        self.automatic_optimization = True
-        
+
     def generate_sample_text(self):
         """Generate sample text using the current model state"""
         logging.info("\nGenerating sample text...")
         logging.info(f"Prompt: {self.test_prompt}")
         
-        # Tokenize the prompt with padding
-        inputs = self.tokenizer(
-            self.test_prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_position_embeddings,
-            return_attention_mask=True
-        )
-        
-        # Move inputs to device
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-        
-        # Set generation parameters
-        gen_kwargs = {
-            "max_length": 100,
-            "num_return_sequences": 1,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "do_sample": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "attention_mask": attention_mask,
-            "use_cache": True,
-            "no_repeat_ngram_size": 3,
-            "early_stopping": False
-        }
-        
         try:
-            # Generate text
+            # Tokenize the prompt with explicit attention mask
+            inputs = self.tokenizer(
+                self.test_prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_position_embeddings,
+                return_attention_mask=True
+            )
+            
+            # Move inputs to device safely
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            
+            # Set generation parameters
+            gen_kwargs = {
+                "max_length": 100,
+                "num_return_sequences": 1,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "do_sample": True,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "attention_mask": attention_mask,
+                "use_cache": True,
+                "no_repeat_ngram_size": 3,
+                "early_stopping": True
+            }
+            
+            # Generate text with error handling
             with torch.no_grad():
-                output_sequences = self.model.generate(
-                    input_ids=input_ids,
-                    **gen_kwargs
-                )
-            
-            # Decode and log the generated text
-            generated_text = self.tokenizer.decode(output_sequences[0], skip_special_tokens=True)
-            logging.info("Generated text:")
-            logging.info("-" * NUM_DASHES)
-            logging.info(generated_text)
-            logging.info("-" * NUM_DASHES)
-            
-            return generated_text
-            
+                try:
+                    output_sequences = self.model.generate(
+                        input_ids=input_ids,
+                        **gen_kwargs
+                    )
+                    
+                    # Decode and log the generated text
+                    generated_text = self.tokenizer.decode(output_sequences[0], skip_special_tokens=True)
+                    logging.info("Generated text:")
+                    logging.info("-" * NUM_DASHES)
+                    logging.info(generated_text)
+                    logging.info("-" * NUM_DASHES)
+                    
+                    return generated_text
+                    
+                except RuntimeError as e:
+                    logging.error(f"Error during generation: {str(e)}")
+                    return None
+                    
         except Exception as e:
-            logging.error(f"Error during text generation: {str(e)}")
+            logging.error(f"Error during text generation setup: {str(e)}")
             return None
 
     def training_step(self, batch, batch_idx):
-        if self.training_start_time is None:
-            self.training_start_time = time.time()
-            self.last_log_time = self.training_start_time
-        
-        step_start = time.time()
-        x, y = batch
-        
-        # Forward pass
-        outputs = self.model(input_ids=x, labels=y)
-        loss = outputs.loss
-        
-        # Calculate training statistics
-        step_end = time.time()
-        step_time = step_end - step_start
-        self.step_times.append(step_time)
-        
-        # Calculate time metrics for every step
-        current_time = time.time()
-        elapsed = current_time - self.training_start_time
-        time_per_step = sum(self.step_times[-100:]) / min(len(self.step_times), 100)
-        steps_remaining = self.total_steps - self.global_step
-        eta = steps_remaining * time_per_step
-        
-        # Log metrics for progress bar
-        self.log_dict({
-            'train_loss': loss,
-            'learning_rate': self.learning_rate,
-            'global_step': self.global_step,
-            'step_time': step_time,
-            'eta': eta,
-            'elapsed': elapsed
-        }, prog_bar=True, sync_dist=True, on_step=True)
-        
-        # # Log detailed information every 50 steps
-        # if self.global_step % 50 == 0:
-        #     logging.info(f"\nBatch {batch_idx}: Input shape: {x.shape}, Input device: {x.device}, "
-        #                 f"Input range: [{x.min().item()}, {x.max().item()}]")
-
-            # if torch.cuda.is_available():
-            #     logging.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
-            #                 f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
+        try:
+            if self.training_start_time is None:
+                self.training_start_time = time.time()
+                self.last_log_time = self.training_start_time
             
-            # logging.info(f"\nTraining Status - Step {self.global_step}/{self.total_steps}")
-            # logging.info(f"- Loss: {loss.item():.4f}, Time elapsed: {timedelta(seconds=int(elapsed))}, "
-            #             f"Average step time: {time_per_step:.3f}s, "
-            #             f"Estimated time remaining: {timedelta(seconds=int(eta))}")
-        
-        return loss
+            step_start = time.time()
+            x, y = batch
+            
+            # Forward pass
+            outputs = self.model(input_ids=x, labels=y)
+            loss = outputs.loss
+            
+            # Check for NaN loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.warning(f"NaN/Inf loss detected at step {self.trainer.global_step}. Skipping batch.")
+                return None
+            
+            # Log metrics
+            self.log('train_loss', loss.item(), prog_bar=True, on_step=True)
+            current_lr = self.optimizers().param_groups[0]['lr']
+            self.log('learning_rate', current_lr, prog_bar=True, on_step=True)
+            
+            # Calculate and log step time
+            step_time = time.time() - step_start
+            self.log('step_time', step_time, prog_bar=True, on_step=True)
+            
+            if self.trainer.global_step % 100 == 0:
+                logging.info(f"Step {self.trainer.global_step}: loss = {loss.item():.4f}, lr = {current_lr:.10f}")
+            
+            # Only do inference on actual steps, not accumulated gradients
+            global_step = self.trainer.global_step
+            if (global_step % self.inference_interval == 0 and 
+                global_step != self.last_inference_step and 
+                global_step > 0):
+                self.last_inference_step = global_step
+                logging.info(f"\nRunning inference at step {global_step}:")
+                self.generate_sample_text()
+            
+            return loss
+            
+        except Exception as e:
+            logging.error(f"Error in training step: {str(e)}")
+            return None
 
     def on_train_start(self):
         """Generate initial sample before training starts"""
@@ -277,115 +280,157 @@ class SmolLM2LightningModule(pl.LightningModule):
         self.generate_sample_text()
 
     def configure_optimizers(self):
-        logging.info(f"Configuring optimizer with learning rate: {self.learning_rate}")
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate)
-        return optimizer
+        # Load config
+        config = load_config()
+        
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            betas=(
+                config['optimizer']['optimizer_factory']['adam_beta1'],
+                config['optimizer']['optimizer_factory']['adam_beta2']
+            ),
+            eps=config['optimizer']['optimizer_factory']['adam_eps'],
+            weight_decay=config['optimizer']['weight_decay']
+        )
+        
+        # Use linear schedule as specified in config
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=self.total_steps
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
 
-def train_model(
-    resume_from_checkpoint: Optional[str] = None,
-    additional_steps: Optional[int] = None
-):
+def signal_handler(signum, frame):
+    print("\nReceived interrupt signal. Cleaning up...")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    sys.exit(0)
+
+def load_config(config_path: str = "config_smollm2_135M.yaml") -> dict:
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+def get_precision_from_config(dtype: str) -> str:
+    """Convert config dtype to PyTorch Lightning precision format"""
+    precision_mapping = {
+        'bfloat16': 'bf16-mixed',
+        'float16': '16-mixed',
+        'float32': '32-true',
+        'float64': '64-true'
+    }
+    return precision_mapping.get(dtype, '32-true')  # Default to 32-true if not found
+
+def train_model(resume_from_checkpoint: Optional[str] = None, additional_steps: Optional[int] = None):
+    # Load configuration
+    config = load_config()
+    
+    # Register signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
     start_time = time.time()
     logging.info("=" * NUM_DASHES)
-    logging.info("Starting training process ...")
+    logging.info("Starting training process...")
     logging.info("=" * NUM_DASHES)
     
-    # Setup training environment (will run only once)
+    # Setup training environment
     setup_training_environment()
     
-    # Set up seeds
-    pl.seed_everything(1566)
-    logging.info("Random seeds set")
+    # Initialize model config with YAML settings
+    model_config = SmolLM2Config135M(**config['model']['model_config'])
     
-    # Initialize config and dataset
-    # logging.info("Initializing model configuration")
-    config = SmolLM2Config135M()
-
-    logging.info("-" * NUM_DASHES)    
-    logging.info("Setting up dataset and data loader")
-    dataset = TextDataset(block_size=128, vocab_size=config.vocab_size)
+    # Initialize dataset with config settings
+    dataset = TextDataset(
+        block_size=config['tokens']['sequence_length'],
+        vocab_size=config['model']['model_config']['vocab_size']
+    )
     
-    # Worker setup
-    num_workers = min(15, os.cpu_count() or 1)
-    logging.info(f"Using {num_workers} workers for data loading")
-    
+    # Configure data loader based on config
     train_loader = DataLoader(
         dataset,
-        batch_size=8,
+        batch_size=config['tokens']['micro_batch_size'],
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=config['data_stages'][0]['data']['num_loading_workers'],
+        pin_memory=False,
         drop_last=True
     )
     
-    # Update step calculation logic
-    if resume_from_checkpoint and additional_steps:
-        logging.info(f"Loading checkpoint: {resume_from_checkpoint}")
-        # Load checkpoint to get current step
-        checkpoint = torch.load(resume_from_checkpoint)
-        # Get the global step from checkpoint
-        current_step = checkpoint.get('global_step', 0)
-        logging.info(f"Resuming from global step {current_step}")
-        # Calculate total steps as current + additional
-        total_steps = current_step + additional_steps
-        logging.info(f"Will train for {additional_steps} more steps until step {total_steps}")
-    else:
-        total_steps = 500  # Default steps for new training
-        current_step = 0
-        logging.info(f"Starting new training for {total_steps} steps")
+    # Initialize model with config
+    model = SmolLM2LightningModule(
+        config=model_config,
+        learning_rate=config['optimizer']['learning_rate_scheduler']['learning_rate'],
+        total_steps=config['tokens']['train_steps'],
+        warmup_steps=config['optimizer']['learning_rate_scheduler']['lr_warmup_steps'],
+    )
     
-    # Model setup
-    # logging.info("Initializing model")
-    model = SmolLM2LightningModule(config=config, total_steps=total_steps)
-    
-    # Create callbacks
+    # Configure checkpointing
     checkpoint_callback = ModelCheckpoint(
         dirpath='lightning_checkpoints',
-        filename='smollm2-{step}-{train_loss:.2f}',
-        every_n_train_steps=20,
+        filename='smollm2-step{step}-loss{train_loss:.2f}',
+        every_n_train_steps=config['checkpoints']['checkpoint_interval'],
         save_top_k=5,
         monitor='train_loss',
         mode='min',
-        save_last=True,
-        save_on_train_epoch_end=False
+        save_last=True
     )
     
-    # Use TQDM progress bar instead
+    # Configure progress bar
     progress_bar = TQDMProgressBar(
-        refresh_rate=1,
-        process_position=0
+        refresh_rate=1
     )
     
-    # Update trainer setup
+    # Configure trainer with config settings
     trainer = pl.Trainer(
-        max_steps=total_steps,
+        max_steps=config['tokens']['train_steps'],
         callbacks=[checkpoint_callback, progress_bar],
-        accelerator='auto',
+        accelerator='cpu',
         devices=1,
-        precision="16-mixed",
+        precision=get_precision_from_config(config['model']['dtype']),  # Convert dtype to supported format
         enable_progress_bar=True,
         logger=True,
-        log_every_n_steps=1,
-        gradient_clip_val=1.0,
-        accumulate_grad_batches=16,
+        log_every_n_steps=config['logging']['iteration_step_info_interval'],
+        gradient_clip_val=config['optimizer']['clip_grad'],
+        accumulate_grad_batches=config['tokens']['batch_accumulation_per_replica'],
         strategy='auto',
         enable_checkpointing=True,
         num_sanity_val_steps=0,
         max_epochs=None,
         check_val_every_n_epoch=None,
-        enable_model_summary=False,
+        enable_model_summary=True,
         reload_dataloaders_every_n_epochs=0,
-        deterministic=True
+        deterministic=False,
+        detect_anomaly=False
     )
-    
-    # Training
+
+    # Add more detailed logging before training
     try:
         logging.info("-" * NUM_DASHES)
         logging.info("Starting training")
+        logging.info(f"Total number of sequences: {len(dataset):,}")
+        logging.info(f"Batch size: {train_loader.batch_size}")
+        logging.info(f"Gradient accumulation steps: {trainer.accumulate_grad_batches}")
+        logging.info(f"Effective batch size: {train_loader.batch_size * trainer.accumulate_grad_batches}")
+        logging.info(f"Number of training steps: {config['tokens']['train_steps']}")
+        logging.info(f"Learning rate: {model.learning_rate}")
+        logging.info("-" * NUM_DASHES)
+        
+        # Clear CUDA cache before training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logging.info("Cleared CUDA cache before training")
+        
         if resume_from_checkpoint:
-            # Pass global_step to ensure correct step counting
             trainer.fit(
                 model, 
                 train_loader, 
@@ -399,7 +444,7 @@ def train_model(
 
         logging.info("\nTraining completed successfully!")
         logging.info(f"Total training time: {timedelta(seconds=int(total_time))}")
-        logging.info(f"Final step: {model.global_step}")
+        logging.info(f"Final step: {model.trainer.global_step}")
         logging.info(f"Checkpoints saved in: {checkpoint_callback.dirpath}")
         
     except Exception as e:
@@ -415,13 +460,23 @@ if __name__ == "__main__":
     parser.add_argument('--additional_steps', type=int, help='Number of additional steps to train')
     args = parser.parse_args()
     
-    logging.info("Setting up environment variables")
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    os.environ['TORCH_USE_CUDA_DSA'] = '1'
-    
-    # logging.info("Starting training script ...")
-    train_model(
-        resume_from_checkpoint=args.resume_checkpoint,
-        additional_steps=args.additional_steps
-    )
+    try:
+        logging.info("Setting up environment variables")
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        os.environ['TORCH_USE_CUDA_DSA'] = '1'
+        
+        train_model(
+            resume_from_checkpoint=args.resume_checkpoint,
+            additional_steps=args.additional_steps
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning up...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        sys.exit(0)
+    except Exception as e:
+        logging.error(f"Error during training: {str(e)}", exc_info=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        sys.exit(1)
 

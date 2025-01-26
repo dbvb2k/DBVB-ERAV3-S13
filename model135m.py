@@ -21,7 +21,7 @@ class SmolLM2Config135M(PretrainedConfig):
         hidden_act: str = "silu",
         max_position_embeddings: int = 2048,
         initializer_range: float = 0.041666666666666664,
-        rms_norm_eps: float = 1e-5,
+        rms_norm_eps: float = 1.0e-05,
         use_cache: bool = True,
         pad_token_id: Optional[int] = None,
         bos_token_id: int = 0,
