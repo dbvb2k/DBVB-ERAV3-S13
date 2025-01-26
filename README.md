@@ -77,12 +77,12 @@ The training process uses PyTorch Lightning with the following key configuration
   - Monitor: train_loss
 
 ## Initial training (v2 is non pytorch-lightning version)
-python train_model135m.py --total_steps 5000  
-python train_model135m_v2.py --total_steps 5000
+python train_model135m.py --total_steps 6000  
+python train_model135m_v2.py --total_steps 6000
  
 ## Resume training with additional steps (v2 is non pytorch-lightning version)
-python train_model135m.py --additional_steps 500  
-python train_model135m_v2.py --additional_steps 500
+python train_model135m.py --additional_steps 1000  
+python train_model135m_v2.py --additional_steps 1000
 
 ## Training Logs
 
