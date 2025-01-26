@@ -91,10 +91,7 @@ Log 1
 ![Training Log 1](./images/training-scr1.png?raw=true "Training Log 1")
 
 Log 2:
-![Training Log 2](./images/training-scr2.png?raw=true "Training Log 2")
+![Training Log 2](./images/training-scr4.png?raw=true "Training Log 2")
 
 Log 3:
-![Training Log 2](./images/training-scr3.png?raw=true "Training Log 3")
-
-Log 4:
-![Training Log 2](./images/training-scr4.png?raw=true "Training Log 4")
+![Training Log 2](./images/training-scr6.png?raw=true "Training Log 3")
