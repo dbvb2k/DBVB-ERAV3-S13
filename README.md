@@ -39,11 +39,11 @@ Parameter count breakdown:
 Total Parameters: ~135M
 
 ## Project Structure 
-.
-├── train_model135m.py # Main training script
-├── model135m.py # Model architecture definition
-├── requirements.txt # Project dependencies
-└── lightning_checkpoints # Training checkpoints directory
+.  
+├── train_model135m.py # Main training script  
+├── model135m.py # Model architecture definition  
+├── requirements.txt # Project dependencies  
+└── lightning_checkpoints # Training checkpoints directory  
 
 ## Requirements
 pytorch>=2.0.0
@@ -76,12 +76,12 @@ The training process uses PyTorch Lightning with the following key configuration
   - Keep Top: 5 checkpoints
   - Monitor: train_loss
 
-# Initial training (v2 is non pytorch-lightning version)
-python train_model135m.py --total_steps 5000
+## Initial training (v2 is non pytorch-lightning version)
+python train_model135m.py --total_steps 5000  
 python train_model135m_v2.py --total_steps 5000
  
-# Resume training with additional steps (v2 is non pytorch-lightning version)
-python train_model135m.py --additional_steps 500
+## Resume training with additional steps (v2 is non pytorch-lightning version)
+python train_model135m.py --additional_steps 500  
 python train_model135m_v2.py --additional_steps 500
 
 ## Training Logs
